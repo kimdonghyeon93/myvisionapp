@@ -59,7 +59,7 @@ if uploaded_file is not None:
         if st.button("AI 분석 실행"):
             try:
                 genai.configure(api_key=api_key)
-                gemini = genai.GenerativeModel('gemini-1.5-flash')
+                gemini = genai.GenerativeModel('gemini-1.0-pro')
                 
                 prompt = f"다음 객체들이 이미지에서 탐지되었습니다: {', '.join(detected_objects)}. 이 객체들을 바탕으로 현재 이미지의 상황이나 주의사항을 간단히 분석해줘."
                 with st.spinner("Gemini가 분석 중입니다..."):
