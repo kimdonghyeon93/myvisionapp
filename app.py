@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from PIL import Image
 from ultralytics import YOLO
 from pathlib import Path
@@ -25,7 +26,8 @@ model = load_model()
 # 3. 설정
 api_key = st.sidebar.text_input("Gemini API Key 입력", type="password")
 
-FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+# gemini-3.1-flash-lite를 기본으로, 실패 시에만 다른 모델로 전환
+FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
 def generate_with_fallback(client, prompt, max_retries=3):
     last_error = None
@@ -74,64 +76,110 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    st.write(f"총 **{len(uploaded_files)}장** 업로드됨")
-
-    all_results_summary = []  # 이미지별 요약 텍스트 모음 (AI 분석용)
-    total_counts = Counter()   # 전체 이미지 통합 클래스별 개수
-
-    for idx, uploaded_file in enumerate(uploaded_files):
-        st.divider()
-        st.subheader(f"이미지 {idx + 1}: {uploaded_file.name}")
-
-        image = Image.open(uploaded_file)
-        results = model.predict(source=image)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("원본")
-            st.image(image, use_container_width=True)
-        with col2:
-            st.caption("탐지 결과")
-            st.image(results[0].plot(), use_container_width=True)
-
+    # 새로 업로드된 파일 세트인지 확인 (다르면 재추론, 같으면 캐시 재사용)
+    file_key = tuple((f.name, f.size) for f in uploaded_files)
+    if st.session_state.get("file_key") != file_key:
+        processed = []
         names = model.names
-        detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
-        confidences = [float(box.conf.item()) for box in results[0].boxes]
-        counts = Counter(detected_objects)
-        total_counts.update(counts)
+        with st.spinner("이미지 추론 중..."):
+            for f in uploaded_files:
+                image = Image.open(f)
+                results = model.predict(source=image)
+                detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
+                confidences = [float(box.conf.item()) for box in results[0].boxes]
+                processed.append({
+                    "name": f.name,
+                    "image": image,
+                    "plot": results[0].plot(),
+                    "detected_objects": detected_objects,
+                    "confidences": confidences,
+                })
+        st.session_state.processed = processed
+        st.session_state.file_key = file_key
+        st.session_state.current_idx = 0
 
-        if detected_objects:
-            st.write(f"탐지 개수: **{len(detected_objects)}개**")
-            count_cols = st.columns(min(len(counts), 6))
-            for col, (obj_name, cnt) in zip(count_cols, counts.items()):
-                col.metric(obj_name, f"{cnt}개")
+    processed = st.session_state.processed
+    total = len(processed)
 
-            with st.expander("상세 내역 (클래스 / 신뢰도)"):
-                for obj_name, conf in zip(detected_objects, confidences):
-                    st.write(f"- {obj_name}: {conf:.2%}")
+    # ---- 좌우 화살표 캐러셀 ----
+    st.subheader("이미지 탐지 결과")
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 4, 1])
 
-            summary = ", ".join(f"{k} {v}개" for k, v in counts.items())
-            all_results_summary.append(f"[{uploaded_file.name}] {summary}")
-        else:
-            st.warning("탐지된 객체 없음")
-            all_results_summary.append(f"[{uploaded_file.name}] 탐지된 객체 없음")
+    with nav_col1:
+        if st.button("◀ 이전", use_container_width=True, disabled=(st.session_state.current_idx == 0)):
+            st.session_state.current_idx -= 1
+            st.rerun()
 
-    # ---- 전체 통합 정보 ----
+    with nav_col3:
+        if st.button("다음 ▶", use_container_width=True, disabled=(st.session_state.current_idx == total - 1)):
+            st.session_state.current_idx += 1
+            st.rerun()
+
+    idx = st.session_state.current_idx
+    current = processed[idx]
+
+    with nav_col2:
+        st.markdown(
+            f"<div style='text-align:center; font-weight:bold;'>{idx + 1} / {total} — {current['name']}</div>",
+            unsafe_allow_html=True,
+        )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("원본")
+        st.image(current["image"], use_container_width=True)
+    with col2:
+        st.caption("탐지 결과")
+        st.image(current["plot"], use_container_width=True)
+
+    if current["detected_objects"]:
+        counts = Counter(current["detected_objects"])
+        st.write(f"탐지 개수: **{len(current['detected_objects'])}개**")
+        count_cols = st.columns(min(len(counts), 6))
+        for col, (obj_name, cnt) in zip(count_cols, counts.items()):
+            col.metric(obj_name, f"{cnt}개")
+    else:
+        st.warning("탐지된 객체 없음")
+
+    # ---- 전체 이미지 결과 표 ----
     st.divider()
-    st.subheader("전체 이미지 통합 통계")
-    if total_counts:
-        total_cols = st.columns(min(len(total_counts), 6))
-        for col, (obj_name, cnt) in zip(total_cols, total_counts.items()):
-            col.metric(f"전체 {obj_name}", f"{cnt}개")
+    st.subheader("전체 이미지 결과 표")
 
-    # ---- AI 일괄 분석 (API 호출 1회로 처리) ----
-    if api_key and all_results_summary:
+    table_rows = []
+    for item in processed:
+        counts = Counter(item["detected_objects"])
+        avg_conf = (
+            sum(item["confidences"]) / len(item["confidences"])
+            if item["confidences"] else 0
+        )
+        table_rows.append({
+            "파일명": item["name"],
+            "탐지 개수": len(item["detected_objects"]),
+            "클래스별 개수": ", ".join(f"{k}:{v}" for k, v in counts.items()) if counts else "-",
+            "평균 신뢰도": f"{avg_conf:.1%}" if item["confidences"] else "-",
+        })
+
+    df = pd.DataFrame(table_rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ---- AI 일괄 분석 ----
+    st.divider()
+    all_results_summary = []
+    for item in processed:
+        counts = Counter(item["detected_objects"])
+        if counts:
+            summary = ", ".join(f"{k} {v}개" for k, v in counts.items())
+        else:
+            summary = "탐지된 객체 없음"
+        all_results_summary.append(f"[{item['name']}] {summary}")
+
+    if api_key and any(item["detected_objects"] for item in processed):
         if st.button("전체 이미지 AI 일괄 분석 실행"):
             try:
                 client = genai.Client(api_key=api_key)
                 joined_summary = "\n".join(all_results_summary)
                 prompt = (
-                    f"총 {len(uploaded_files)}장의 이미지에 대한 검사 결과입니다.\n"
+                    f"총 {total}장의 이미지에 대한 검사 결과입니다.\n"
                     f"{joined_summary}\n"
                     "전체적인 검사 결과를 이미지별로 간단히 분석하고, "
                     "전체 경향(불량/이상 패턴 등)도 요약해줘."
@@ -145,5 +193,5 @@ if uploaded_files:
             except Exception as e:
                 st.error(f"분석 오류: {e}")
                 st.write("오류가 지속되면 [Google AI Studio](https://aistudio.google.com/)에서 'Create API key'를 눌러 새 키를 발급받으세요.")
-    elif not api_key and all_results_summary:
+    elif not api_key:
         st.warning("사이드바에 Gemini API Key를 입력해주세요.")
