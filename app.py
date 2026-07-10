@@ -15,8 +15,8 @@ import re
 # =========================================================
 # 페이지 설정
 # =========================================================
-st.set_page_config(page_title="YOLO & CNN & Gemini 분석", layout="wide")
-st.title("비전 검사 분석 서비스")
+st.set_page_config(page_title="케이블 분류 · 검출 서비스", layout="wide")
+st.title("케이블 분류 / 검출 서비스")
 
 # =========================================================
 # 공통: Gemini 호출 (fallback + 재시도)
@@ -34,7 +34,7 @@ def generate_with_fallback(client, prompt, max_retries=3):
                     config={
                         "system_instruction": (
                             "당신은 산업 검사 현장의 분석 보조원입니다. "
-                            "탐지/분류 결과만 근거로 짧고 실무적으로 답하세요. "
+                            "케이블 검출/분류 결과만 근거로 짧고 실무적으로 답하세요. "
                             "불필요한 서론, 감탄사, 장황한 설명 없이 핵심만 말하세요. "
                             "여러 이미지 결과가 주어지면 이미지별로 구분해서 요약하세요."
                         ),
@@ -93,7 +93,7 @@ def ai_analysis_block(api_key, summary_lines, total, button_key):
                 client = genai.Client(api_key=api_key)
                 joined_summary = "\n".join(summary_lines)
                 prompt = (
-                    f"총 {total}장의 이미지에 대한 검사 결과입니다.\n"
+                    f"총 {total}장의 케이블 이미지에 대한 검사 결과입니다.\n"
                     f"{joined_summary}\n"
                     "전체적인 검사 결과를 이미지별로 간단히 분석하고, "
                     "전체 경향(불량/이상 패턴 등)도 요약해줘."
@@ -110,7 +110,7 @@ def ai_analysis_block(api_key, summary_lines, total, button_key):
 
 
 # =========================================================
-# Object Detection (YOLO) 모델 로드
+# 케이블 검출 (YOLO) 모델 로드
 # =========================================================
 @st.cache_resource
 def load_yolo_model():
@@ -122,7 +122,7 @@ def load_yolo_model():
 
 
 # =========================================================
-# Classification (CNN) 모델 정의 및 로드
+# 케이블 분류 (CNN) 모델 정의 및 로드
 # =========================================================
 class SmallCNN(nn.Module):
     def __init__(self):
@@ -158,9 +158,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 @st.cache_resource
 def load_cls_model():
-    model_path = Path("models/small_cnn_bottle_normal_defect.pth")
+    model_path = Path("models/small_cnn_cable_normal_defect.pth")
     if not model_path.exists():
-        st.error("분류 모델 파일을 찾을 수 없습니다. (models/small_cnn_bottle_normal_defect.pth)")
+        st.error("분류 모델 파일을 찾을 수 없습니다. (models/small_cnn_cable_normal_defect.pth)")
         st.stop()
     m = SmallCNN().to(DEVICE)
     m.load_state_dict(torch.load(model_path, map_location=DEVICE))
@@ -193,7 +193,7 @@ def predict_classification(cls_model, pil_image):
 st.sidebar.header("설정")
 mode = st.sidebar.radio(
     "분석 방식 선택",
-    ["Object Detection (YOLO)", "Classification (CNN 정상/불량)"],
+    ["케이블 검출 (Detection)", "케이블 분류 (Classification)"],
 )
 api_key = st.sidebar.text_input("Gemini API Key 입력", type="password")
 
@@ -202,10 +202,10 @@ st.sidebar.caption(f"연산 장치: {DEVICE.upper()}")
 
 
 # =========================================================
-# 모드 1: Object Detection
+# 모드 1: 케이블 검출 (YOLO)
 # =========================================================
-if mode == "Object Detection (YOLO)":
-    st.header("Object Detection (YOLO)")
+if mode == "케이블 검출 (Detection)":
+    st.header("케이블 검출 (Detection)")
     yolo_model = load_yolo_model()
 
     uploaded_files = st.file_uploader(
@@ -290,10 +290,10 @@ if mode == "Object Detection (YOLO)":
 
 
 # =========================================================
-# 모드 2: Classification (CNN 정상/불량)
+# 모드 2: 케이블 분류 (CNN 정상/불량)
 # =========================================================
 else:
-    st.header("Classification (CNN 정상/불량)")
+    st.header("케이블 분류 (Classification)")
     cls_model = load_cls_model()
 
     uploaded_files = st.file_uploader(
