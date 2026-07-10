@@ -457,9 +457,9 @@ else:
 
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    # 빈 DataFrame으로 스키마를 먼저 지정 (add_rows 오류 방지)
-                    loss_chart = st.line_chart(pd.DataFrame({"loss": pd.Series(dtype="float64")}))
-
+                    chart_placeholder = st.empty()
+                    loss_history = []
+                    
                     for epoch in range(epochs):
                         cnn.train()
                         losses = []
@@ -470,11 +470,13 @@ else:
                             loss.backward()
                             optimizer.step()
                             losses.append(loss.item())
-
+                    
                         avg_loss = float(np.mean(losses))
+                        loss_history.append(avg_loss)
+                    
                         progress_bar.progress((epoch + 1) / epochs)
                         status_text.text(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.5f}")
-                        loss_chart.add_rows(pd.DataFrame({"loss": [avg_loss]}))
+                        chart_placeholder.line_chart(pd.DataFrame({"loss": loss_history}))
 
                     # 평가
                     cnn.eval()
