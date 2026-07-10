@@ -51,15 +51,16 @@ if uploaded_file is not None:
     st.write(f"**총 탐지된 객체 수:** {obj_count}개")
     st.write(f"**객체 목록:** {', '.join(detected_objects) if detected_objects else '없음'}")
     
-    # 5. Gemini 분석 (오류 해결 버전)
+    # 5. Gemini 분석 (가장 단순하고 안정적인 호출 방식)
     if api_key and obj_count > 0:
         if st.button("AI 분석 실행"):
             try:
                 genai.configure(api_key=api_key)
-                # 속성 오류를 피하기 위해 모델명을 직접 명시
-                gemini = genai.GenerativeModel("gemini-1.5-flash")
                 
-                prompt = f"탐지된 객체: {', '.join(detected_objects)}. 이 객체들을 바탕으로 현재 이미지의 상황이나 주의사항을 간단히 분석해줘."
+                # 모델명을 단순하게 설정 (라이브러리 버전에 따라 동작)
+                gemini = genai.GenerativeModel("gemini-1.5-flash-latest")
+                
+                prompt = f"탐지된 객체: {', '.join(detected_objects)}. 이미지의 상황이나 주의사항을 간단히 분석해줘."
                 
                 with st.spinner("Gemini 분석 중..."):
                     response = gemini.generate_content(prompt)
