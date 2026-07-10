@@ -8,12 +8,12 @@ import google.generativeai as genai
 st.set_page_config(page_title="YOLO & Gemini 분석", layout="wide")
 st.title("객체 탐지 및 AI 분석 서비스")
 
-# 2. 모델 로드
+# 2. 모델 로드 (캐싱)
 @st.cache_resource
 def load_model():
     model_path = Path("models/best.pt")
     if not model_path.exists():
-        st.error(f"모델 파일을 찾을 수 없습니다: {model_path.absolute()}")
+        st.error(f"모델 파일을 찾을 수 없습니다.")
         st.stop()
     return YOLO(model_path)
 
@@ -34,6 +34,7 @@ if uploaded_file is not None:
     with col1:
         st.image(image, caption="업로드 이미지", use_container_width=True)
     
+    # YOLO 탐지
     with st.spinner("탐지 중..."):
         results = model.predict(source=image, conf=conf_threshold)
         res_plotted = results[0].plot()
@@ -41,6 +42,7 @@ if uploaded_file is not None:
     with col2:
         st.image(res_plotted, caption="탐지 결과", use_container_width=True)
         
+    # 정보 추출
     names = model.names
     detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
     obj_count = len(detected_objects)
@@ -49,28 +51,22 @@ if uploaded_file is not None:
     st.write(f"**총 탐지된 객체 수:** {obj_count}개")
     st.write(f"**객체 목록:** {', '.join(detected_objects) if detected_objects else '없음'}")
     
-    # 5. Gemini 분석 로직 (동적 모델 선택으로 404 오류 방지)
+    # 5. Gemini 분석 (가장 안정적인 방식)
     if api_key and obj_count > 0:
         if st.button("AI 분석 실행"):
             try:
                 genai.configure(api_key=api_key)
                 
-                # 오류 방지: 사용 가능한 모델 목록 중 첫 번째 모델을 자동으로 선택
-                models = [m for m in genai.list_models() if "generateContent" in m.supported_methods]
-                if not models:
-                    st.error("사용 가능한 모델을 찾을 수 없습니다. API 키 권한을 확인하세요.")
-                else:
-                    selected_model = models[0]
-                    gemini = genai.GenerativeModel(selected_model.name)
-                    
-                    prompt = f"탐지된 객체: {', '.join(detected_objects)}. 이미지의 상황이나 주의사항을 간단히 분석해줘."
-                    
-                    with st.spinner(f"{selected_model.name}으로 분석 중..."):
-                        response = gemini.generate_content(prompt)
-                        st.subheader("AI 분석 결과")
-                        st.info(response.text)
+                # 모델명을 직접 지정하여 속성 오류 방지
+                gemini = genai.GenerativeModel("gemini-1.5-flash")
+                
+                prompt = f"탐지된 객체: {', '.join(detected_objects)}. 이미지의 상황이나 주의사항을 간단히 분석해줘."
+                
+                with st.spinner("Gemini 분석 중..."):
+                    response = gemini.generate_content(prompt)
+                    st.subheader("AI 분석 결과")
+                    st.info(response.text)
             except Exception as e:
                 st.error(f"분석 중 오류 발생: {e}")
-                st.write("팁: 404 오류가 계속되면 Google AI Studio에서 새 API 키를 발급받아보세요.")
     elif obj_count > 0:
         st.warning("분석을 위해 사이드바에 API 키를 입력하세요.")
