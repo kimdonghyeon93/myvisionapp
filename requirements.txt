@@ -2,6 +2,6 @@ streamlit>=1.38
 pillow>=10.0
 ultralytics>=8.3
 google-genai>=1.0
-opencv-python-headless
+opencv-python-headless==4.10.0.84
 pandas>=2.0
 torch>=2.0
