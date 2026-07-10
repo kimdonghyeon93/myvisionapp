@@ -2,4 +2,4 @@ streamlit
 ultralytics
 pillow
 opencv-python-headless
-google-generativeai
+google-genai
