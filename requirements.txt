@@ -1,5 +1,8 @@
-streamlit
-ultralytics
-pillow
+streamlit>=1.38
+pillow>=10.0
+ultralytics>=8.3
+google-genai>=1.0
 opencv-python-headless
-google-genai
+pandas>=2.0
+torch>=2.0
+scikit-learn>=1.3
