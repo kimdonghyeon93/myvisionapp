@@ -4,6 +4,8 @@ import numpy as np
 import cv2
 import torch
 from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 from PIL import Image
 from ultralytics import YOLO
 from pathlib import Path
@@ -11,12 +13,50 @@ from google import genai
 from collections import Counter
 import time
 import re
+import zipfile
+import shutil
+import tempfile
 
 # =========================================================
 # 페이지 설정
 # =========================================================
 st.set_page_config(page_title="케이블 분류 · 검출 서비스", layout="wide")
 st.title("케이블 분류 / 검출 서비스")
+
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(exist_ok=True)
+YOLO_MODEL_PATH = MODELS_DIR / "best.pt"
+CLS_MODEL_PATH = MODELS_DIR / "small_cnn_cable_normal_defect.pth"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def imread(path, flags=cv2.IMREAD_COLOR):
+    """한글 경로에서도 안전하게 이미지 읽기 (노트북과 동일)"""
+    data = np.fromfile(str(path), dtype=np.uint8)
+    return cv2.imdecode(data, flags)
+
+
+def extract_zip_to_temp(uploaded_zip):
+    tmp_dir = Path(tempfile.mkdtemp())
+    zip_path = tmp_dir / "data.zip"
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_zip.getbuffer())
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(tmp_dir)
+    return tmp_dir
+
+
+def find_category_root(extracted_dir):
+    """
+    zip 안에서 MVTec 카테고리 구조(train/good, test 폴더가 있는 위치)를 찾음.
+    zip을 category 폴더 자체로 올리든, 그 category를 감싼 폴더로 올리든 모두 대응.
+    """
+    candidates = [extracted_dir] + [p for p in extracted_dir.rglob("*") if p.is_dir()]
+    for p in candidates:
+        if (p / "train" / "good").exists() and (p / "test").exists():
+            return p
+    return None
+
 
 # =========================================================
 # 공통: Gemini 호출 (fallback + 재시도)
@@ -64,29 +104,24 @@ def generate_with_fallback(client, prompt, max_retries=3):
 
 
 def render_carousel_nav(session_prefix, total):
-    """이전/다음 버튼 캐러셀 네비게이션 UI. 현재 인덱스를 리턴."""
     idx_key = f"{session_prefix}_idx"
     if idx_key not in st.session_state:
         st.session_state[idx_key] = 0
-
     nav_col1, nav_col2, nav_col3 = st.columns([1, 4, 1])
     with nav_col1:
         if st.button("◀ 이전", use_container_width=True,
-                      disabled=(st.session_state[idx_key] == 0),
-                      key=f"{session_prefix}_prev"):
+                      disabled=(st.session_state[idx_key] == 0), key=f"{session_prefix}_prev"):
             st.session_state[idx_key] -= 1
             st.rerun()
     with nav_col3:
         if st.button("다음 ▶", use_container_width=True,
-                      disabled=(st.session_state[idx_key] == total - 1),
-                      key=f"{session_prefix}_next"):
+                      disabled=(st.session_state[idx_key] == total - 1), key=f"{session_prefix}_next"):
             st.session_state[idx_key] += 1
             st.rerun()
     return st.session_state[idx_key], nav_col2
 
 
 def ai_analysis_block(api_key, summary_lines, total, button_key):
-    """공통 AI 일괄 분석 UI + 호출"""
     if api_key and summary_lines:
         if st.button("전체 이미지 AI 일괄 분석 실행", key=button_key):
             try:
@@ -114,37 +149,24 @@ def ai_analysis_block(api_key, summary_lines, total, button_key):
 # =========================================================
 @st.cache_resource
 def load_yolo_model():
-    model_path = Path("models/best.pt")
-    if not model_path.exists():
-        st.error("YOLO 모델 파일을 찾을 수 없습니다. (models/best.pt)")
+    if not YOLO_MODEL_PATH.exists():
+        st.error(f"YOLO 모델 파일을 찾을 수 없습니다. ({YOLO_MODEL_PATH})")
         st.stop()
-    return YOLO(model_path)
+    return YOLO(YOLO_MODEL_PATH)
 
 
 # =========================================================
-# 케이블 분류 (CNN) 모델 정의 및 로드
+# 케이블 분류 (CNN) 모델 정의 및 로드 — 노트북과 동일 구조
 # =========================================================
 class SmallCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 8, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(8, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
+            nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
             nn.Flatten(),
-
-            nn.Linear(8 * 8 * 32, 32),
-            nn.ReLU(),
-
+            nn.Linear(8 * 8 * 32, 32), nn.ReLU(),
             nn.Linear(32, 2)
         )
 
@@ -153,33 +175,29 @@ class SmallCNN(nn.Module):
 
 
 CLS_LABEL_NAMES = ["정상", "불량"]
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @st.cache_resource
 def load_cls_model():
-    model_path = Path("models/small_cnn_cable_normal_defect.pth")
-    if not model_path.exists():
-        st.error("분류 모델 파일을 찾을 수 없습니다. (models/small_cnn_cable_normal_defect.pth)")
+    if not CLS_MODEL_PATH.exists():
+        st.error(f"분류 모델 파일을 찾을 수 없습니다. ({CLS_MODEL_PATH})")
         st.stop()
     m = SmallCNN().to(DEVICE)
-    m.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    m.load_state_dict(torch.load(CLS_MODEL_PATH, map_location=DEVICE))
     m.eval()
     return m
 
 
 def predict_classification(cls_model, pil_image):
-    """PIL(RGB) 이미지를 받아 학습 때와 동일한 BGR 순서로 변환 후 추론"""
+    """PIL(RGB) -> BGR 변환 후 추론 (노트북의 cv2.imread와 채널 순서 일치)"""
     image_rgb = np.array(pil_image.convert("RGB"))
-    image_bgr = image_rgb[:, :, ::-1]  # RGB -> BGR (학습 데이터와 채널 순서 일치)
+    image_bgr = image_rgb[:, :, ::-1]
     image_resized = cv2.resize(image_bgr, (64, 64)).astype(np.float32) / 255.0
     x = torch.tensor(image_resized.copy()).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
     with torch.no_grad():
         output = cls_model(x)
         probability = torch.softmax(output, dim=1)
         pred = probability.argmax(1).item()
-
     return {
         "label": CLS_LABEL_NAMES[pred],
         "prob_normal": probability[0, 0].item(),
@@ -188,15 +206,50 @@ def predict_classification(cls_model, pil_image):
 
 
 # =========================================================
-# 사이드바: 모드 선택 + API 키
+# CNN 학습용 Dataset — 노트북의 ImageDataset과 동일
+# =========================================================
+class CableImageDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        image = imread(path, cv2.IMREAD_COLOR)
+        image = cv2.resize(image, (64, 64)).astype(np.float32) / 255.0
+        return torch.tensor(image).permute(2, 0, 1), torch.tensor(label, dtype=torch.long)
+
+
+# =========================================================
+# YOLO 학습용: 마스크 -> 바운딩 박스 변환 — 노트북의 bbox_from_mask/write_label과 동일
+# =========================================================
+def bbox_from_mask(mask_path):
+    mask = imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return xs.min(), ys.min(), xs.max(), ys.max()
+
+
+def write_yolo_label(label_path, bbox, shape, class_id):
+    h, w = shape[:2]
+    x1, y1, x2, y2 = bbox
+    cx, cy = ((x1 + x2) / 2) / w, ((y1 + y2) / 2) / h
+    bw, bh = (x2 - x1) / w, (y2 - y1) / h
+    label_path.write_text(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n", encoding="utf-8")
+
+
+# =========================================================
+# 사이드바
 # =========================================================
 st.sidebar.header("설정")
 mode = st.sidebar.radio(
-    "분석 방식 선택",
-    ["케이블 검출 (Detection)", "케이블 분류 (Classification)"],
+    "메뉴 선택",
+    ["케이블 검출 (Detection)", "케이블 분류 (Classification)", "모델 학습 (Training)"],
 )
 api_key = st.sidebar.text_input("Gemini API Key 입력", type="password")
-
 st.sidebar.divider()
 st.sidebar.caption(f"연산 장치: {DEVICE.upper()}")
 
@@ -209,10 +262,8 @@ if mode == "케이블 검출 (Detection)":
     yolo_model = load_yolo_model()
 
     uploaded_files = st.file_uploader(
-        "이미지 업로드 (여러 장 선택 가능)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="det_uploader",
+        "이미지 업로드 (여러 장 선택 가능)", type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True, key="det_uploader",
     )
 
     if uploaded_files:
@@ -223,15 +274,12 @@ if mode == "케이블 검출 (Detection)":
             with st.spinner("이미지 추론 중..."):
                 for f in uploaded_files:
                     image = Image.open(f)
-                    results = yolo_model.predict(source=image)
+                    results = yolo_model.predict(source=image, conf=0.05)
                     detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
                     confidences = [float(box.conf.item()) for box in results[0].boxes]
                     processed.append({
-                        "name": f.name,
-                        "image": image,
-                        "plot": results[0].plot(),
-                        "detected_objects": detected_objects,
-                        "confidences": confidences,
+                        "name": f.name, "image": image, "plot": results[0].plot(),
+                        "detected_objects": detected_objects, "confidences": confidences,
                     })
             st.session_state.det_processed = processed
             st.session_state.det_file_key = file_key
@@ -244,10 +292,7 @@ if mode == "케이블 검출 (Detection)":
         idx, nav_col2 = render_carousel_nav("det", total)
         current = processed[idx]
         with nav_col2:
-            st.markdown(
-                f"<div style='text-align:center; font-weight:bold;'>{idx + 1} / {total} — {current['name']}</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<div style='text-align:center; font-weight:bold;'>{idx + 1} / {total} — {current['name']}</div>", unsafe_allow_html=True)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -268,15 +313,12 @@ if mode == "케이블 검출 (Detection)":
 
         st.divider()
         st.subheader("전체 이미지 결과 표")
-        table_rows = []
-        summary_lines = []
+        table_rows, summary_lines = [], []
         for item in processed:
             counts = Counter(item["detected_objects"])
-            avg_conf = (sum(item["confidences"]) / len(item["confidences"])
-                        if item["confidences"] else 0)
+            avg_conf = sum(item["confidences"]) / len(item["confidences"]) if item["confidences"] else 0
             table_rows.append({
-                "파일명": item["name"],
-                "탐지 개수": len(item["detected_objects"]),
+                "파일명": item["name"], "탐지 개수": len(item["detected_objects"]),
                 "클래스별 개수": ", ".join(f"{k}:{v}" for k, v in counts.items()) if counts else "-",
                 "평균 신뢰도": f"{avg_conf:.1%}" if item["confidences"] else "-",
             })
@@ -284,7 +326,6 @@ if mode == "케이블 검출 (Detection)":
             summary_lines.append(f"[{item['name']}] {summary}")
 
         st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
         st.divider()
         ai_analysis_block(api_key, summary_lines, total, button_key="det_ai_btn")
 
@@ -292,15 +333,13 @@ if mode == "케이블 검출 (Detection)":
 # =========================================================
 # 모드 2: 케이블 분류 (CNN 정상/불량)
 # =========================================================
-else:
+elif mode == "케이블 분류 (Classification)":
     st.header("케이블 분류 (Classification)")
     cls_model = load_cls_model()
 
     uploaded_files = st.file_uploader(
-        "이미지 업로드 (여러 장 선택 가능)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="cls_uploader",
+        "이미지 업로드 (여러 장 선택 가능)", type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True, key="cls_uploader",
     )
 
     if uploaded_files:
@@ -311,11 +350,7 @@ else:
                 for f in uploaded_files:
                     image = Image.open(f)
                     result = predict_classification(cls_model, image)
-                    processed.append({
-                        "name": f.name,
-                        "image": image,
-                        **result,
-                    })
+                    processed.append({"name": f.name, "image": image, **result})
             st.session_state.cls_processed = processed
             st.session_state.cls_file_key = file_key
             st.session_state.cls_idx = 0
@@ -327,10 +362,7 @@ else:
         idx, nav_col2 = render_carousel_nav("cls", total)
         current = processed[idx]
         with nav_col2:
-            st.markdown(
-                f"<div style='text-align:center; font-weight:bold;'>{idx + 1} / {total} — {current['name']}</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<div style='text-align:center; font-weight:bold;'>{idx + 1} / {total} — {current['name']}</div>", unsafe_allow_html=True)
 
         img_col, info_col = st.columns([1, 1])
         with img_col:
@@ -345,20 +377,270 @@ else:
 
         st.divider()
         st.subheader("전체 이미지 결과 표")
-        table_rows = []
-        summary_lines = []
+        table_rows, summary_lines = [], []
         for item in processed:
             table_rows.append({
-                "파일명": item["name"],
-                "판정": item["label"],
-                "정상 확률": f"{item['prob_normal']:.1%}",
-                "불량 확률": f"{item['prob_defect']:.1%}",
+                "파일명": item["name"], "판정": item["label"],
+                "정상 확률": f"{item['prob_normal']:.1%}", "불량 확률": f"{item['prob_defect']:.1%}",
             })
-            summary_lines.append(
-                f"[{item['name']}] 판정: {item['label']} (정상 {item['prob_normal']:.1%}, 불량 {item['prob_defect']:.1%})"
-            )
+            summary_lines.append(f"[{item['name']}] 판정: {item['label']} (정상 {item['prob_normal']:.1%}, 불량 {item['prob_defect']:.1%})")
 
         st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
         st.divider()
         ai_analysis_block(api_key, summary_lines, total, button_key="cls_ai_btn")
+
+
+# =========================================================
+# 모드 3: 모델 학습 (Training) — 실제 노트북 파이프라인 그대로 구현
+# =========================================================
+else:
+    st.header("모델 학습 (Training)")
+    train_target = st.radio("학습할 모델 선택", ["케이블 분류 모델 (CNN)", "케이블 검출 모델 (YOLO)"])
+
+    # ---------------------------------------------------
+    # CNN 분류 모델 학습 — 노트북 02번과 동일 로직
+    # ---------------------------------------------------
+    if train_target == "케이블 분류 모델 (CNN)":
+        st.subheader("케이블 분류 모델 학습 (CNN)")
+        st.markdown(
+            "**zip 파일 구조 (MVTec `cable` 카테고리 폴더 그대로):**\n"
+            "```\n"
+            "cable.zip\n"
+            "└── cable/\n"
+            "    ├── train/good/*.png\n"
+            "    └── test/\n"
+            "        ├── good/*.png\n"
+            "        ├── bent_wire/*.png\n"
+            "        ├── cut_inner_insulation/*.png\n"
+            "        └── ... (기타 결함 폴더)\n"
+            "```\n"
+            "※ `train/good` + `test/good` → 정상(0), 나머지 `test/<결함유형>` → 불량(1)로 라벨링됩니다 (노트북과 동일)."
+        )
+
+        uploaded_zip = st.file_uploader("cable 카테고리 zip 업로드", type=["zip"], key="cls_train_zip")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            epochs = st.number_input("Epochs", min_value=1, max_value=200, value=30)
+        with col2:
+            batch_size = st.number_input("Batch size", min_value=1, max_value=128, value=16)
+        with col3:
+            defect_limit = st.number_input(
+                "결함 폴더당 최대 이미지 수", min_value=5, max_value=200, value=20,
+                help="노트북에서는 결함 유형별로 최대 20장만 사용했습니다.",
+            )
+
+        if uploaded_zip is not None and st.button("분류 모델 학습 시작"):
+            extracted_dir = extract_zip_to_temp(uploaded_zip)
+            category = find_category_root(extracted_dir)
+
+            if category is None:
+                st.error("zip 안에서 train/good, test 폴더 구조를 찾지 못했습니다. cable 카테고리 폴더 구조를 다시 확인해주세요.")
+            else:
+                normal_paths = sorted((category / "train" / "good").glob("*.png"))
+                normal_paths += sorted((category / "test" / "good").glob("*.png"))
+
+                defect_paths = []
+                for defect_dir in sorted((category / "test").iterdir()):
+                    if defect_dir.is_dir() and defect_dir.name != "good":
+                        defect_paths += sorted(defect_dir.glob("*.png"))[:defect_limit]
+
+                if not normal_paths or not defect_paths:
+                    st.error("정상 또는 불량 이미지를 찾지 못했습니다. 폴더 구조를 확인해주세요.")
+                else:
+                    st.write(f"정상 이미지: {len(normal_paths)}장 / 불량 이미지: {len(defect_paths)}장")
+
+                    samples = [(p, 0) for p in normal_paths] + [(p, 1) for p in defect_paths]
+                    train_samples, test_samples = train_test_split(
+                        samples, test_size=0.25, random_state=42,
+                        stratify=[label for _, label in samples],
+                    )
+                    st.write(f"train: {len(train_samples)}장 / test: {len(test_samples)}장")
+
+                    train_loader = DataLoader(CableImageDataset(train_samples), batch_size=batch_size, shuffle=True)
+                    test_loader = DataLoader(CableImageDataset(test_samples), batch_size=32)
+
+                    cnn = SmallCNN().to(DEVICE)
+                    optimizer = torch.optim.Adam(cnn.parameters(), lr=0.001)
+                    criterion = nn.CrossEntropyLoss()
+
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    loss_chart = st.line_chart()
+
+                    for epoch in range(epochs):
+                        cnn.train()
+                        losses = []
+                        for x, y in train_loader:
+                            x, y = x.to(DEVICE), y.to(DEVICE)
+                            optimizer.zero_grad()
+                            loss = criterion(cnn(x), y)
+                            loss.backward()
+                            optimizer.step()
+                            losses.append(loss.item())
+
+                        avg_loss = np.mean(losses)
+                        progress_bar.progress((epoch + 1) / epochs)
+                        status_text.text(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.5f}")
+                        loss_chart.add_rows({"loss": [avg_loss]})
+
+                    # 평가 — 노트북과 동일한 accuracy/precision/recall/f1
+                    cnn.eval()
+                    correct = total = tp = fp = fn = 0
+                    with torch.no_grad():
+                        for x, y in test_loader:
+                            pred = cnn(x.to(DEVICE)).argmax(1).cpu()
+                            correct += (pred == y).sum().item()
+                            total += len(y)
+                            tp += ((pred == 1) & (y == 1)).sum().item()
+                            fp += ((pred == 1) & (y == 0)).sum().item()
+                            fn += ((pred == 0) & (y == 1)).sum().item()
+
+                    accuracy = correct / total
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+                    st.success("학습 완료!")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Accuracy", f"{accuracy:.1%}")
+                    m2.metric("Precision", f"{precision:.1%}")
+                    m3.metric("Recall", f"{recall:.1%}")
+                    m4.metric("F1 Score", f"{f1:.1%}")
+
+                    torch.save(cnn.state_dict(), CLS_MODEL_PATH)
+                    st.info(f"모델이 저장되었습니다: {CLS_MODEL_PATH}")
+                    load_cls_model.clear()
+
+                    with open(CLS_MODEL_PATH, "rb") as f:
+                        st.download_button("학습된 모델 다운로드 (.pth)", f, file_name=CLS_MODEL_PATH.name)
+
+            shutil.rmtree(extracted_dir, ignore_errors=True)
+
+    # ---------------------------------------------------
+    # YOLO 검출 모델 학습 — 노트북 03번과 동일 로직 (마스크 -> 박스 자동 변환)
+    # ---------------------------------------------------
+    else:
+        st.subheader("케이블 검출 모델 학습 (YOLO)")
+        st.warning(
+            "YOLO 학습은 CPU 환경에서 오래 걸리고, Streamlit Cloud에서는 타임아웃/메모리 부족으로 "
+            "실패할 수 있습니다. 가능하면 로컬 GPU 환경에서 학습 후 best.pt만 업로드하는 것을 권장합니다."
+        )
+        st.markdown(
+            "**zip 파일 구조 (MVTec `cable` 카테고리, ground_truth 마스크 포함):**\n"
+            "```\n"
+            "cable.zip\n"
+            "└── cable/\n"
+            "    ├── test/\n"
+            "    │   ├── good/*.png\n"
+            "    │   ├── bent_wire/*.png\n"
+            "    │   └── ... (기타 결함 폴더)\n"
+            "    └── ground_truth/\n"
+            "        ├── bent_wire/*_mask.png\n"
+            "        └── ...\n"
+            "```\n"
+            "결함 유형별 마스크에서 바운딩 박스를 자동 계산하고, "
+            "결함 유형(예: bent_wire, cut_inner_insulation)을 각각 별도 클래스로 학습합니다 (노트북과 동일)."
+        )
+
+        uploaded_zip = st.file_uploader("cable 카테고리 zip 업로드 (ground_truth 포함)", type=["zip"], key="det_train_zip")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            yolo_epochs = st.number_input("Epochs", min_value=1, max_value=300, value=50)
+        with col2:
+            imgsz = st.selectbox("이미지 크기", [320, 480, 640, 960], index=0)
+        with col3:
+            per_defect_limit = st.number_input(
+                "결함 유형당 최대 이미지 수", min_value=5, max_value=200, value=30,
+                help="노트북에서는 결함 유형별로 최대 30장만 사용했습니다.",
+            )
+
+        if uploaded_zip is not None and st.button("검출 모델 학습 시작"):
+            extracted_dir = extract_zip_to_temp(uploaded_zip)
+            category = None
+            for p in [extracted_dir] + [d for d in extracted_dir.rglob("*") if d.is_dir()]:
+                if (p / "test").exists() and (p / "ground_truth").exists():
+                    category = p
+                    break
+
+            if category is None:
+                st.error("zip 안에서 test/, ground_truth/ 폴더 구조를 찾지 못했습니다.")
+            else:
+                defect_dirs = sorted([
+                    p for p in (category / "test").iterdir()
+                    if p.is_dir() and p.name != "good"
+                ])
+                class_names = [p.name for p in defect_dirs]
+                class_to_id = {name: idx for idx, name in enumerate(class_names)}
+
+                if not class_names:
+                    st.error("test/ 폴더 안에서 결함 유형 폴더를 찾지 못했습니다.")
+                else:
+                    st.write("탐지 클래스:", class_names)
+
+                    work = Path(tempfile.mkdtemp()) / "yolo_dataset"
+                    for split in ["train", "val"]:
+                        (work / "images" / split).mkdir(parents=True, exist_ok=True)
+                        (work / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+                    i = 0
+                    with st.spinner("마스크 -> 바운딩 박스 변환 중..."):
+                        for defect_dir in defect_dirs:
+                            for image_path in sorted(defect_dir.glob("*.png"))[:per_defect_limit]:
+                                mask_path = category / "ground_truth" / defect_dir.name / f"{image_path.stem}_mask.png"
+                                if not mask_path.exists():
+                                    continue
+                                bbox = bbox_from_mask(mask_path)
+                                if bbox is None:
+                                    continue
+
+                                split = "val" if i % 5 == 0 else "train"
+                                target_image = work / "images" / split / f"{i:04d}.png"
+                                target_label = work / "labels" / split / f"{i:04d}.txt"
+                                shutil.copy2(image_path, target_image)
+                                write_yolo_label(target_label, bbox, imread(image_path).shape, class_to_id[defect_dir.name])
+                                i += 1
+
+                    if i == 0:
+                        st.error("변환된 이미지가 없습니다. test/와 ground_truth/의 파일명 규칙(_mask.png)을 확인해주세요.")
+                    else:
+                        yaml_lines = [
+                            f"path: {work.resolve().as_posix()}",
+                            "train: images/train",
+                            "val: images/val",
+                            "names:",
+                        ]
+                        for class_id, class_name in enumerate(class_names):
+                            yaml_lines.append(f"  {class_id}: {class_name}")
+
+                        yaml_path = work / "data.yaml"
+                        yaml_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+                        st.write(f"총 {i}장 변환 완료. data.yaml 생성됨.")
+
+                        st.info("학습을 시작합니다. 데이터 양과 epoch 수에 따라 상당한 시간이 걸릴 수 있습니다...")
+                        with st.spinner("YOLO 학습 중..."):
+                            train_yolo = YOLO("yolov8n.pt")
+                            train_result = train_yolo.train(
+                                data=str(yaml_path),
+                                epochs=int(yolo_epochs),
+                                imgsz=int(imgsz),
+                                batch=8,
+                                project=str(tempfile.mkdtemp()),
+                                name="cable_yolo_train",
+                            )
+
+                        best_pt_path = Path(train_result.save_dir) / "weights" / "best.pt"
+
+                        if best_pt_path.exists():
+                            st.success("학습 완료!")
+                            shutil.copy(best_pt_path, YOLO_MODEL_PATH)
+                            st.info(f"모델이 저장되었습니다: {YOLO_MODEL_PATH}")
+                            load_yolo_model.clear()
+
+                            with open(best_pt_path, "rb") as f:
+                                st.download_button("학습된 모델 다운로드 (.pt)", f, file_name="best.pt")
+                        else:
+                            st.error("학습은 완료됐지만 best.pt 파일을 찾지 못했습니다.")
+
+            shutil.rmtree(extracted_dir, ignore_errors=True)
