@@ -16,7 +16,7 @@ api_key = st.sidebar.text_input("Gemini API Key 입력", type="password")
 def load_model():
     model_path = Path("models/best.pt")
     if not model_path.exists():
-        st.error(f"모델 파일을 찾을 수 없습니다: {model_path.absolute()}")
+        st.error(f"모델 파일을 찾을 수 없습니다.")
         st.stop()
     return YOLO(model_path)
 
@@ -36,7 +36,6 @@ if uploaded_file is not None:
     with col1:
         st.image(image, caption="업로드 이미지", use_container_width=True)
     
-    # 탐지 실행
     with st.spinner("탐지 중..."):
         results = model.predict(source=image, conf=conf_threshold)
         res_plotted = results[0].plot()
@@ -44,28 +43,32 @@ if uploaded_file is not None:
     with col2:
         st.image(res_plotted, caption="탐지 결과", use_container_width=True)
         
-    # 정보 추출
     names = model.names
     detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
     obj_count = len(detected_objects)
     
-    # UI에 개수 및 목록 표시
     st.subheader("탐지 요약")
     st.write(f"**총 탐지된 객체 수:** {obj_count}개")
     st.write(f"**객체 목록:** {', '.join(detected_objects) if detected_objects else '없음'}")
     
-    # 5. Gemini API를 이용한 해석
+    # 5. Gemini 자동 모델 선택 및 분석
     if api_key and obj_count > 0:
         if st.button("AI 분석 실행"):
             try:
                 genai.configure(api_key=api_key)
-                gemini = genai.GenerativeModel('gemini-1.0-pro')
-                
-                prompt = f"다음 객체들이 이미지에서 탐지되었습니다: {', '.join(detected_objects)}. 이 객체들을 바탕으로 현재 이미지의 상황이나 주의사항을 간단히 분석해줘."
-                with st.spinner("Gemini가 분석 중입니다..."):
-                    response = gemini.generate_content(prompt)
-                    st.subheader("AI 분석 결과")
-                    st.info(response.text)
+                # 사용 가능한 모델 목록에서 첫 번째 것을 가져옴
+                models = [m.name for m in genai.list_models() if "generateContent" in m.supported_methods]
+                if not models:
+                    st.error("사용 가능한 모델을 찾을 수 없습니다.")
+                else:
+                    target_model = models[0] # 자동으로 첫 번째 모델 사용
+                    gemini = genai.GenerativeModel(target_model)
+                    
+                    prompt = f"탐지된 객체: {', '.join(detected_objects)}. 이미지의 상황과 주의사항을 분석해줘."
+                    with st.spinner(f"{target_model} 모델로 분석 중..."):
+                        response = gemini.generate_content(prompt)
+                        st.subheader(f"AI 분석 결과 ({target_model})")
+                        st.info(response.text)
             except Exception as e:
                 st.error(f"분석 중 오류 발생: {e}")
     elif not api_key and obj_count > 0:
