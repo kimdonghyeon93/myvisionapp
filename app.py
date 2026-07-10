@@ -3,6 +3,7 @@ from PIL import Image
 from ultralytics import YOLO
 from pathlib import Path
 from google import genai
+from collections import Counter
 import time
 import re
 
@@ -31,7 +32,20 @@ def generate_with_fallback(client, prompt, max_retries=3):
     for model_name in FALLBACK_MODELS:
         for attempt in range(max_retries):
             try:
-                return client.models.generate_content(model=model_name, contents=prompt), model_name
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={
+                        "system_instruction": (
+                            "당신은 산업 검사 현장의 분석 보조원입니다. "
+                            "탐지된 객체 목록만 근거로 짧고 실무적으로 답하세요. "
+                            "불필요한 서론, 감탄사, 장황한 설명 없이 3~5문장으로 핵심만 말하세요."
+                        ),
+                        "max_output_tokens": 300,
+                        "temperature": 0.3,
+                    },
+                )
+                return response, model_name
             except Exception as e:
                 error_str = str(e)
                 last_error = e
@@ -68,12 +82,32 @@ if uploaded_file is not None:
 
     names = model.names
     detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
+    confidences = [float(box.conf.item()) for box in results[0].boxes]
 
+    # ---- 탐지 정보 표시 ----
+    st.subheader("탐지된 객체 정보")
+    if detected_objects:
+        counts = Counter(detected_objects)
+        st.write(f"총 탐지 개수: **{len(detected_objects)}개**")
+
+        count_cols = st.columns(len(counts))
+        for col, (obj_name, cnt) in zip(count_cols, counts.items()):
+            col.metric(obj_name, f"{cnt}개")
+
+        with st.expander("상세 내역 (클래스 / 신뢰도)"):
+            for obj_name, conf in zip(detected_objects, confidences):
+                st.write(f"- {obj_name}: {conf:.2%}")
+    else:
+        st.warning("탐지된 객체가 없습니다.")
+
+    # ---- AI 분석 ----
     if api_key and detected_objects:
         if st.button("AI 분석 실행"):
             try:
                 client = genai.Client(api_key=api_key)
-                prompt = f"탐지된 객체: {', '.join(detected_objects)}. 상황 분석해줘."
+                counts = Counter(detected_objects)
+                summary = ", ".join(f"{k} {v}개" for k, v in counts.items())
+                prompt = f"탐지된 객체 목록: {summary}. 이 검사 결과를 간단히 분석해줘."
 
                 with st.spinner("분석 중..."):
                     response, used_model = generate_with_fallback(client, prompt)
@@ -83,7 +117,5 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"분석 오류: {e}")
                 st.write("오류가 지속되면 [Google AI Studio](https://aistudio.google.com/)에서 'Create API key'를 눌러 새 키를 발급받으세요.")
-    elif not detected_objects:
-        st.warning("탐지된 객체가 없습니다.")
-    elif not api_key:
+    elif not api_key and detected_objects:
         st.warning("사이드바에 Gemini API Key를 입력해주세요.")
