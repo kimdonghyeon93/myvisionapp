@@ -2,7 +2,7 @@ import streamlit as st
 from PIL import Image
 from ultralytics import YOLO
 from pathlib import Path
-from google import genai  # 새 통합 SDK (pip install -U google-genai)
+from google import genai
 
 # 1. 페이지 설정
 st.set_page_config(page_title="YOLO & Gemini 분석", layout="wide")
@@ -24,10 +24,19 @@ api_key = st.sidebar.text_input("Gemini API Key 입력", type="password")
 
 # 4. 분석 실행
 uploaded_file = st.file_uploader("이미지 업로드", type=["jpg", "jpeg", "png"])
+
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
     results = model.predict(source=image)
-    st.image(results[0].plot())
+
+    # 원본 / 결과 나란히 표시
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("원본")
+        st.image(image, use_container_width=True)
+    with col2:
+        st.subheader("탐지 결과")
+        st.image(results[0].plot(), use_container_width=True)
 
     names = model.names
     detected_objects = [names[int(box.cls.item())] for box in results[0].boxes]
@@ -40,7 +49,7 @@ if uploaded_file is not None:
                 prompt = f"탐지된 객체: {', '.join(detected_objects)}. 상황 분석해줘."
 
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",  # 필요시 "gemini-2.5-pro" 또는 "gemini-3.5-flash"
+                    model="gemini-3.5-flash",
                     contents=prompt,
                 )
                 st.info(response.text)
@@ -48,3 +57,7 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"분석 오류: {e}")
                 st.write("오류가 지속되면 [Google AI Studio](https://aistudio.google.com/)에서 'Create API key'를 눌러 새 키를 발급받으세요.")
+    elif not detected_objects:
+        st.warning("탐지된 객체가 없습니다.")
+    elif not api_key:
+        st.warning("사이드바에 Gemini API Key를 입력해주세요.")
